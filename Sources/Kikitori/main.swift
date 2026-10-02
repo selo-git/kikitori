@@ -43,11 +43,14 @@ if arguments.count >= 3, arguments[1] == "--render-hud" {
                 TrackStatus(name: "マイク", level: 0.08, problem: nil),
                 TrackStatus(name: "PCの音", level: 0, problem: "止まっています")])),
             ("idle", RecorderStatus(state: .idle, processingCount: 1)),
+            ("delete-armed", RecorderStatus(state: .recording, elapsed: 754, tracks: [
+                TrackStatus(name: "マイク", level: 0.12, problem: nil)])),
         ]
         for (name, status) in samples {
             let model = HUDModel()
             model.update(status)
-            let renderer = ImageRenderer(content: HUDView(model: model).padding(14).background(Color(white: 0.75)))
+            let view = HUDView(model: model, actions: HUDActions(), deleteArmed: name == "delete-armed")
+            let renderer = ImageRenderer(content: view.padding(14).background(Color(white: 0.75)))
             renderer.scale = 2
             if let image = renderer.nsImage, let tiff = image.tiffRepresentation,
                let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) {

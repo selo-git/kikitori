@@ -55,15 +55,6 @@ final class HotKey {
         return m
     }
 
-    static func modifierFlags(fromCarbon m: UInt32) -> NSEvent.ModifierFlags {
-        var flags: NSEvent.ModifierFlags = []
-        if m & UInt32(controlKey) != 0 { flags.insert(.control) }
-        if m & UInt32(optionKey) != 0 { flags.insert(.option) }
-        if m & UInt32(shiftKey) != 0 { flags.insert(.shift) }
-        if m & UInt32(cmdKey) != 0 { flags.insert(.command) }
-        return flags
-    }
-
     static func label(modifiers: UInt32, keyName: String) -> String {
         var s = ""
         if modifiers & UInt32(controlKey) != 0 { s += "⌃" }

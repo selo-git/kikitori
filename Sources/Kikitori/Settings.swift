@@ -53,7 +53,7 @@ enum HotkeyAction: String, CaseIterable, Identifiable {
         case .toggle: return "録音の開始 / 終了"
         case .pause: return "一時停止 / 再開"
         case .discard: return "録音を破棄 (ゴミ箱へ)"
-        case .peek: return "録音状態を確認 (押している間)"
+        case .peek: return "録音状態の表示 (切り替え)"
         }
     }
 }

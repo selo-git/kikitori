@@ -30,6 +30,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.perform(action, pressed: pressed)
         }
         hud.statusProvider = { [weak self] in self?.recorderStatus() ?? RecorderStatus() }
+        hud.actions = HUDActions(
+            start: { [weak self] in self?.startRecording() },
+            togglePause: { [weak self] in self?.togglePause() },
+            finish: { [weak self] in self?.stopRecording() },
+            discard: { [weak self] in self?.discardRecording() }
+        )
         registerHotKey()
 
         settings.objectWillChange
@@ -68,10 +74,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func perform(_ action: HotkeyAction, pressed: Bool) {
         switch (action, pressed) {
         case (.peek, true):
-            let modifiers = settings.hotkeys[.peek].map { HotKey.modifierFlags(fromCarbon: $0.modifiers) } ?? []
-            hud.show(holding: modifiers)
-        case (.peek, false):
-            hud.hide()
+            hud.toggle()
         case (_, false):
             break
         case (.toggle, true):
