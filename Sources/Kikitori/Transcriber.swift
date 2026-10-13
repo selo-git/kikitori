@@ -8,6 +8,8 @@ struct TranscriptionOptions {
     var keepRawTracks: Bool
     var modelPath: String
     var sourceLabel: String
+    /// 指定したファイルを文字起こしする場合の元ファイル (録音のときは nil)
+    var originalFile: URL?
 
     @MainActor
     static func current(source: AudioSource) -> TranscriptionOptions {
@@ -16,6 +18,17 @@ struct TranscriptionOptions {
                                     keepRawTracks: s.keepRawTracks,
                                     modelPath: (s.modelPath as NSString).expandingTildeInPath,
                                     sourceLabel: source.label)
+    }
+
+    /// 録画・音声ファイルの文字起こし用。元ファイルがあるので音声は保存しない
+    @MainActor
+    static func current(file: URL) -> TranscriptionOptions {
+        var options = current(source: .mic)
+        options.keepAudio = false
+        options.keepRawTracks = false
+        options.sourceLabel = "ファイル"
+        options.originalFile = file
+        return options
     }
 }
 
@@ -33,7 +46,9 @@ enum Transcriber {
     }
 
     /// 録音トラックをミックスして文字起こしし、<フォルダ名>.txt / .srt (/ .m4a) を作る
-    static func process(folder: URL, tracks: [Track], date: Date, options: TranscriptionOptions) async throws -> TranscriptResult {
+    /// - Parameter progress: 文字起こしの進み具合 (0〜1)。バックグラウンドスレッドから呼ばれる
+    static func process(folder: URL, tracks: [Track], date: Date, options: TranscriptionOptions,
+                        progress: ((Double) -> Void)? = nil) async throws -> TranscriptResult {
         guard !tracks.isEmpty else { throw KikitoriError.noAudio }
         guard let ffmpeg = Shell.find("ffmpeg") else { throw KikitoriError.toolNotFound("ffmpeg") }
         guard let whisper = Shell.find("whisper-cli") else { throw KikitoriError.toolNotFound("whisper-cli") }
@@ -87,16 +102,25 @@ enum Transcriber {
             args += ["-map", raw.label, "-c:a", "flac", "-sample_fmt", "s16", raw.url.path]
         }
         args += ["-map", "[a16]", "-ac", "1", "-c:a", "pcm_s16le", wav.path]
-        _ = try await Shell.run(ffmpeg, args)
+        do {
+            _ = try await Shell.run(ffmpeg, args)
+        } catch KikitoriError.toolFailed(_, _, let output) where output.contains("matches no streams") {
+            throw KikitoriError.noAudioStream
+        }
 
         let duration = (try? AVAudioFile(forReading: wav)).map { Double($0.length) / $0.fileFormat.sampleRate } ?? 0
 
         // 2. whisper-cli で文字起こし (SRT出力)
         var wargs = ["-m", options.modelPath, "-f", wav.path, "-l", options.language,
-                     "-osrt", "-of", base.path, "-np"]
+                     "-osrt", "-of", base.path, "-np", "-pp"]
         if !options.prompt.isEmpty { wargs += ["--prompt", options.prompt] }
         if FileManager.default.fileExists(atPath: vadModelPath) { wargs += ["--vad", "-vm", vadModelPath] }
-        _ = try await Shell.run(whisper, wargs)
+        _ = try await Shell.run(whisper, wargs) { line in
+            // "whisper_print_progress_callback: progress =  62%"
+            guard let progress, let range = line.range(of: "progress =") else { return }
+            let number = line[range.upperBound...].trimmingCharacters(in: CharacterSet(charactersIn: " %"))
+            if let percent = Double(number) { progress(percent / 100) }
+        }
 
         // 3. SRT → タイムスタンプ付きテキスト
         let srtURL = base.appendingPathExtension("srt")
@@ -108,10 +132,13 @@ enum Transcriber {
         let dateFormatter = DateFormatter()
         dateFormatter.locale = Locale(identifier: "ja_JP")
         dateFormatter.dateFormat = "yyyy年M月d日(E) HH:mm:ss"
+        let sourceLine = options.originalFile.map {
+            "元のファイル: \($0.path.replacingOccurrences(of: FileManager.default.homeDirectoryForCurrentUser.path, with: "~"))"
+        } ?? "録音ソース: \(options.sourceLabel)"
         let header = """
         日時: \(dateFormatter.string(from: date))
         長さ: \(timestamp(duration))
-        録音ソース: \(options.sourceLabel)
+        \(sourceLine)
 
         """
         let textURL = base.appendingPathExtension("txt")
@@ -186,7 +213,8 @@ enum Shell {
             .first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
-    static func run(_ path: String, _ args: [String]) async throws -> String {
+    /// - Parameter onLine: 出力を1行ずつ受け取る (進み具合の表示用)。バックグラウンドスレッドから呼ばれる
+    static func run(_ path: String, _ args: [String], onLine: ((String) -> Void)? = nil) async throws -> String {
         try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 let process = Process()
@@ -201,7 +229,21 @@ enum Shell {
                     continuation.resume(throwing: error)
                     return
                 }
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                var data = Data()
+                var pending = Data()
+                let handle = pipe.fileHandleForReading
+                while true {
+                    let chunk = handle.availableData
+                    if chunk.isEmpty { break } // EOF
+                    data.append(chunk)
+                    guard let onLine else { continue }
+                    pending.append(chunk)
+                    while let end = pending.firstIndex(where: { $0 == 0x0A || $0 == 0x0D }) {
+                        let line = String(decoding: pending[pending.startIndex..<end], as: UTF8.self)
+                        pending.removeSubrange(pending.startIndex...end)
+                        if !line.isEmpty { onLine(line) }
+                    }
+                }
                 process.waitUntilExit()
                 let output = String(decoding: data, as: UTF8.self)
                 if process.terminationStatus == 0 {

@@ -11,6 +11,7 @@ enum KikitoriError: LocalizedError {
     case modelNotFound(String)
     case toolFailed(String, Int32, String)
     case noAudio
+    case noAudioStream
 
     var errorDescription: String? {
         switch self {
@@ -30,6 +31,8 @@ enum KikitoriError: LocalizedError {
             return "\(name) が失敗しました (終了コード \(status))\n\(output)"
         case .noAudio:
             return "録音データがありません。"
+        case .noAudioStream:
+            return "このファイルには音声が入っていません。"
         }
     }
 }

@@ -38,6 +38,7 @@ struct SettingsView: View {
     @State private var loginItemError: String?
     @State private var micAuthorized = false
     @State private var screenAuthorized = false
+    @State private var dropTargeted = false
 
     var body: some View {
         HStack(spacing: 0) {
@@ -133,6 +134,29 @@ struct SettingsView: View {
 
     @ViewBuilder
     private var transcriptionPane: some View {
+        Section("ファイルから文字起こし") {
+            VStack(spacing: 8) {
+                Image(systemName: "film")
+                    .font(.title2)
+                    .foregroundStyle(.secondary)
+                Text("録画・音声ファイルをここにドロップ")
+                Button("ファイルを選ぶ…") {
+                    NotificationCenter.default.post(name: .kikitoriTranscribeFiles, object: nil)
+                }
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 18)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .strokeBorder(style: StrokeStyle(lineWidth: 1.5, dash: [5]))
+                    .foregroundStyle(dropTargeted ? Color.accentColor : Color.secondary.opacity(0.5))
+            )
+            .dropDestination(for: URL.self) { urls, _ in
+                NotificationCenter.default.post(name: .kikitoriTranscribeFiles, object: urls)
+                return !urls.isEmpty
+            } isTargeted: { dropTargeted = $0 }
+            caption("mp4・mov などの動画や、m4a・mp3・wav などの音声に対応しています。Finder で右クリック →「このアプリケーションで開く」→ Kikitori でも文字起こしできます。結果は保存先フォルダに作られ、複数のファイルは1件ずつ順番に処理します。")
+        }
         Section("文字起こし") {
             Picker("言語", selection: $settings.language) {
                 ForEach(TranscriptLanguage.allCases) { Text($0.label).tag($0) }

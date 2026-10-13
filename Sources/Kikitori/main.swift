@@ -1,7 +1,8 @@
 import AppKit
 import SwiftUI
 
-// 動作確認用: Kikitori --transcribe <音声ファイル> [<音声ファイル>…] で、録音済みファイルを文字起こしパイプラインに通す
+// 動作確認用: Kikitori --transcribe <ファイル> [<ファイル>…] で、文字起こしパイプラインに通す
+// 1本ならアプリの「ファイルを文字起こし」と同じ扱い (音声は保存しない)。
 // 複数渡すと、マイク + PCの音の録音として扱う (時刻合わせの確認用に、2本目以降は1.5秒ずつ遅れて始まったことにする)
 let arguments = CommandLine.arguments
 if arguments.count >= 3, arguments[1] == "--transcribe" {
@@ -11,15 +12,18 @@ if arguments.count >= 3, arguments[1] == "--transcribe" {
     let folder = FileManager.default.temporaryDirectory.appendingPathComponent("kikitori-test-\(Int(Date().timeIntervalSince1970))")
     try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
     let home = FileManager.default.homeDirectoryForCurrentUser.path
+    let isFile = tracks.count == 1
     let options = TranscriptionOptions(language: "ja", prompt: "",
-                                       keepAudio: true, keepRawTracks: true,
+                                       keepAudio: !isFile, keepRawTracks: !isFile,
                                        modelPath: "\(home)/.cache/whisper-cpp/ggml-large-v3-turbo.bin",
-                                       sourceLabel: "テスト")
+                                       sourceLabel: "テスト", originalFile: isFile ? tracks[0].url : nil)
     let semaphore = DispatchSemaphore(value: 0)
     Task.detached {
         do {
             let result = try await Transcriber.process(folder: folder, tracks: tracks,
-                                                       date: Date(), options: options)
+                                                       date: Date(), options: options) { p in
+                print("progress \(Int(p * 100))%")
+            }
             print(result.textURL.path)
             print(try String(contentsOf: result.textURL, encoding: .utf8))
         } catch {

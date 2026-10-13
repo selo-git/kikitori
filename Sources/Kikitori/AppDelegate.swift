@@ -1,7 +1,25 @@
 import AppKit
 import Combine
 import SwiftUI
+import UniformTypeIdentifiers
 import UserNotifications
+
+/// 文字起こしの順番待ち1件分
+@MainActor
+final class TranscriptionJob {
+    let title: String
+    var isRunning = false
+    var progress: Double?
+
+    init(title: String) {
+        self.title = title
+    }
+}
+
+extension Notification.Name {
+    /// 設定画面などから、ファイルの文字起こしを依頼する (object: [URL] または nil = ファイル選択画面を出す)
+    static let kikitoriTranscribeFiles = Notification.Name("KikitoriTranscribeFiles")
+}
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -15,7 +33,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private var session: RecordingSession?
     private var isStarting = false
-    private var processingCount = 0
+    /// 文字起こしは GPU を使うので、録音・ファイルとも1件ずつ順番に処理する
+    private var jobs: [TranscriptionJob] = []
+    private var queueTail: Task<Void, Never>?
+    private var processingCount: Int { jobs.count }
     private var lastTranscript: URL?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -50,6 +71,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         center.delegate = NotificationHandler.shared
         center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
 
+        NotificationCenter.default.publisher(for: .kikitoriTranscribeFiles)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] note in
+                if let urls = note.object as? [URL] {
+                    self?.transcribeFiles(urls)
+                } else {
+                    self?.chooseFilesToTranscribe()
+                }
+            }
+            .store(in: &cancellables)
+
         refreshStatusItem()
         recoverUnprocessed()
 
@@ -63,6 +95,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         showSettings()
         return true
+    }
+
+    /// Finder の「このアプリケーションで開く」やアイコンへのドロップ
+    func application(_ application: NSApplication, open urls: [URL]) {
+        transcribeFiles(urls)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -88,10 +125,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func recorderStatus() -> RecorderStatus {
         guard let session else {
-            return RecorderStatus(state: .idle, processingCount: processingCount)
+            return RecorderStatus(state: .idle, processingCount: processingCount, processingProgress: currentProgress)
         }
         return RecorderStatus(state: session.isPaused ? .paused : .recording, elapsed: session.elapsed,
-                              tracks: session.trackStatuses(), processingCount: processingCount)
+                              tracks: session.trackStatuses(), processingCount: processingCount,
+                              processingProgress: currentProgress)
+    }
+
+    private var currentProgress: Double? {
+        jobs.first(where: \.isRunning)?.progress
     }
 
     private func toggleRecording() {
@@ -134,14 +176,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         session = nil
         timer?.invalidate()
         timer = nil
-        processingCount += 1
         refreshStatusItem()
 
         Task {
             let tracks = await finished.stop()
             playSound("Pop")
             let options = TranscriptionOptions.current(source: finished.source)
-            await transcribe(folder: finished.folder, tracks: tracks, date: finished.startDate, options: options)
+            enqueue(title: "録音 \(finished.folder.lastPathComponent)") { job in
+                await self.transcribe(folder: finished.folder, tracks: tracks, date: finished.startDate,
+                                      options: options, job: job)
+            }
         }
     }
 
@@ -176,13 +220,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private func transcribe(folder: URL, tracks: [Track], date: Date, options: TranscriptionOptions) async {
-        defer {
-            processingCount -= 1
+    /// 文字起こしを順番待ちに加える。前の文字起こしが終わってから始まる
+    private func enqueue(title: String, work: @escaping (TranscriptionJob) async -> Void) {
+        let job = TranscriptionJob(title: title)
+        jobs.append(job)
+        refreshStatusItem()
+        let previous = queueTail
+        queueTail = Task {
+            await previous?.value
+            job.isRunning = true
+            await work(job)
+            jobs.removeAll { $0 === job }
             refreshStatusItem()
         }
+    }
+
+    private func transcribe(folder: URL, tracks: [Track], date: Date, options: TranscriptionOptions,
+                            job: TranscriptionJob) async {
         do {
-            let result = try await Transcriber.process(folder: folder, tracks: tracks, date: date, options: options)
+            let result = try await Transcriber.process(folder: folder, tracks: tracks, date: date, options: options) { p in
+                Task { @MainActor in job.progress = p }
+            }
             lastTranscript = result.textURL
             if settings.copyToClipboard {
                 NSPasteboard.general.clearContents()
@@ -193,21 +251,76 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         } catch {
             NSLog("Kikitori: transcription failed: \(error)")
-            notify(title: "文字起こしに失敗しました", body: error.localizedDescription, file: nil)
+            notify(title: "文字起こしに失敗しました", body: "\(job.title)\n\(error.localizedDescription)", file: nil)
+            // ファイルの文字起こしで何も作られなかった場合は、空のフォルダを残さない
+            if options.originalFile != nil,
+               (try? FileManager.default.contentsOfDirectory(atPath: folder.path))?.isEmpty ?? false {
+                try? FileManager.default.removeItem(at: folder)
+            }
+        }
+    }
+
+    // MARK: - ファイルの文字起こし
+
+    static let transcribableTypes: [UTType] = [.audio, .movie, .audiovisualContent]
+
+    @objc private func chooseFilesToTranscribe() {
+        let panel = NSOpenPanel()
+        panel.title = "文字起こしする録画・音声ファイルを選択"
+        panel.prompt = "文字起こし"
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        panel.allowedContentTypes = Self.transcribableTypes
+        NSApp.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK else { return }
+        transcribeFiles(panel.urls)
+    }
+
+    /// 1ファイルずつ保存フォルダに「<日時>_<元のファイル名>」のフォルダを作り、文字起こしを順番待ちに加える
+    private func transcribeFiles(_ urls: [URL]) {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd_HHmmss"
+        let stamp = formatter.string(from: Date())
+        for url in urls where !url.hasDirectoryPath {
+            let type = UTType(filenameExtension: url.pathExtension)
+            guard let type, Self.transcribableTypes.contains(where: { type.conforms(to: $0) }) else {
+                notify(title: "文字起こしできないファイルです", body: "\(url.lastPathComponent) は録画・音声ファイルではありません。", file: nil)
+                continue
+            }
+            let stem = String(url.deletingPathExtension().lastPathComponent
+                .replacingOccurrences(of: "/", with: "-")
+                .replacingOccurrences(of: ":", with: "-")
+                .prefix(60))
+            var folder = settings.outputURL.appendingPathComponent("\(stamp)_\(stem)")
+            var n = 2
+            while FileManager.default.fileExists(atPath: folder.path) {
+                folder = settings.outputURL.appendingPathComponent("\(stamp)_\(stem)-\(n)")
+                n += 1
+            }
+            do {
+                try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            } catch {
+                notify(title: "文字起こしを開始できませんでした", body: error.localizedDescription, file: nil)
+                continue
+            }
+            let values = try? url.resourceValues(forKeys: [.creationDateKey, .contentModificationDateKey])
+            let date = values?.creationDate ?? values?.contentModificationDate ?? Date()
+            let options = TranscriptionOptions.current(file: url)
+            enqueue(title: url.lastPathComponent) { job in
+                await self.transcribe(folder: folder, tracks: [Track(url: url, startHostTime: nil)], date: date,
+                                      options: options, job: job)
+            }
         }
     }
 
     /// 録音中にアプリが終了した場合などに残った録音を文字起こしする
     private func recoverUnprocessed() {
-        let folders = Transcriber.unprocessedFolders(in: settings.outputURL, excluding: nil)
-        guard !folders.isEmpty else { return }
-        processingCount += folders.count
-        refreshStatusItem()
-        Task {
-            for folder in folders {
-                let date = (try? folder.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? Date()
-                let options = TranscriptionOptions.current(source: settings.audioSource)
-                await transcribe(folder: folder, tracks: Transcriber.tracks(inFolder: folder), date: date, options: options)
+        for folder in Transcriber.unprocessedFolders(in: settings.outputURL, excluding: nil) {
+            let date = (try? folder.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? Date()
+            let options = TranscriptionOptions.current(source: settings.audioSource)
+            enqueue(title: "録音 \(folder.lastPathComponent)") { job in
+                await self.transcribe(folder: folder, tracks: Transcriber.tracks(inFolder: folder), date: date,
+                                      options: options, job: job)
             }
         }
     }
@@ -253,6 +366,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             status = "待機中"
         }
         menu.addItem(NSMenuItem(title: status, action: nil, keyEquivalent: ""))
+        for job in jobs {
+            let detail = job.isRunning ? (job.progress.map { "\(Int($0 * 100))%" } ?? "準備中") : "順番待ち"
+            let jobItem = NSMenuItem(title: "    \(job.title) — \(detail)", action: nil, keyEquivalent: "")
+            jobItem.isEnabled = false
+            menu.addItem(jobItem)
+        }
 
         if let session {
             menu.addItem(item(withHotkey: session.isPaused ? "再開" : "一時停止", .pause, #selector(pauseFromMenu)))
@@ -280,6 +399,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(sourceItem)
 
         menu.addItem(.separator())
+        menu.addItem(item("ファイルを文字起こし…", #selector(chooseFilesToTranscribe), key: "o"))
         let openLast = item("最新の文字起こしを開く", #selector(openLastTranscript))
         openLast.isEnabled = lastTranscript != nil
         menu.addItem(openLast)

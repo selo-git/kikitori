@@ -9,6 +9,8 @@ struct RecorderStatus {
     var elapsed: TimeInterval = 0
     var tracks: [TrackStatus] = []
     var processingCount = 0
+    /// 処理中の文字起こしの進み具合 (0〜1)
+    var processingProgress: Double?
 }
 
 /// 表示中のボタンから呼ぶ操作
@@ -262,7 +264,7 @@ struct HUDView: View {
                     .font(.system(size: 11))
                     .foregroundStyle(secondary)
             case .idle:
-                Text(model.status.processingCount > 0 ? "文字起こし中 \(model.status.processingCount)件" : "録音していません")
+                Text(processingText)
                     .font(.system(size: 11))
                     .foregroundStyle(secondary)
             }
@@ -303,6 +305,13 @@ struct HUDView: View {
                 actions.close()
             }
         }
+    }
+
+    private var processingText: String {
+        let status = model.status
+        guard status.processingCount > 0 else { return "録音していません" }
+        let percent = status.processingProgress.map { " (\(Int($0 * 100))%)" } ?? ""
+        return "文字起こし中 \(status.processingCount)件\(percent)"
     }
 
     private func hint(_ text: String, _ action: HotkeyAction) -> String {
